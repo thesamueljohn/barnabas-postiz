@@ -28,6 +28,7 @@ import { useUser } from '@gitroom/frontend/components/layout/user.context';
 import { AiImage } from '@gitroom/frontend/components/launches/ai.image';
 import { DropFiles } from '@gitroom/frontend/components/layout/drop.files';
 import { deleteDialog } from '@gitroom/react/helpers/delete.dialog';
+import { loadVars } from '@gitroom/react/helpers/variable.context';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { ThirdPartyMedia } from '@gitroom/frontend/components/third-parties/third-party.media';
 import { ReactSortable } from 'react-sortablejs';
@@ -58,6 +59,10 @@ const Polonto = dynamic(
   () => import('@gitroom/frontend/components/launches/polonto')
 );
 const showModalEmitter = new EventEmitter();
+// The built-in Polotno design editor needs its own licence key (NEXT_PUBLIC_POLOTNO). Without one, don't offer it.
+const hasDesignEditor = () =>
+  typeof window !== 'undefined' && !!loadVars()?.plontoKey;
+
 // on phones the media library takes the whole screen
 export const mediaLibrarySize = () =>
   window.matchMedia('(max-width: 1025px)').matches
@@ -974,19 +979,21 @@ export const MultiMediaComponent: FC<{
                     </div>
                   </div>
                 </div>
-                <div
-                  onClick={designMedia}
-                  className="cursor-pointer h-[30px] rounded-[6px] justify-center items-center flex bg-newColColor px-[8px] mobile:hidden"
-                >
-                  <div className="flex gap-[5px] items-center">
-                    <div>
-                      <DesignMediaIcon />
-                    </div>
-                    <div className="text-[10px] font-[600] iconBreak:hidden block">
-                      {t('design_media', 'Design Media')}
+                {hasDesignEditor() && (
+                  <div
+                    onClick={designMedia}
+                    className="cursor-pointer h-[30px] rounded-[6px] justify-center items-center flex bg-newColColor px-[8px] mobile:hidden"
+                  >
+                    <div className="flex gap-[5px] items-center">
+                      <div>
+                        <DesignMediaIcon />
+                      </div>
+                      <div className="text-[10px] font-[600] iconBreak:hidden block">
+                        {t('design_media', 'Design Media')}
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
 
                 {!insertInContent && (
                   <ThirdPartyMedia allData={allData} onChange={changeMedia} />
@@ -1134,12 +1141,14 @@ export const MediaComponent: FC<{
       )}
       <div className="flex gap-[5px]">
         <Button onClick={showModal}>{t('select', 'Select')}</Button>
-        <Button
-          onClick={showDesignModal}
-          className="!bg-customColor45 mobile:hidden"
-        >
-          {t('editor', 'Editor')}
-        </Button>
+        {hasDesignEditor() && (
+          <Button
+            onClick={showDesignModal}
+            className="!bg-customColor45 mobile:hidden"
+          >
+            {t('editor', 'Editor')}
+          </Button>
+        )}
         <Button secondary={true} onClick={clearMedia}>
           {t('clear', 'Clear')}
         </Button>
