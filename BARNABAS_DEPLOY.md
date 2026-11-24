@@ -40,7 +40,7 @@ social networks fetch uploaded images from your public address, and OAuth callba
 ## 4. AGPL-3.0 obligations (this is a modified, network-hosted fork)
 - Users of the hosted app must be able to get the **complete source of your modified version**.
   Publish this fork (for example a public GitHub repo) and link it somewhere visible in the app or its login page.
-  *That visible link is not added yet.*
+  The login page now shows a link to the source (`SOURCE_CODE_URL` in `apps/frontend/src/components/ui/source-link.tsx`): set it to where you publish this fork.
 - Keep the `LICENSE` file and the existing copyright notices.
 - Barnabas Studio is a separate program that only calls the API; it is not part of this fork.
 - This is a summary, not legal advice. Check the license text.
