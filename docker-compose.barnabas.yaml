@@ -1,0 +1,9 @@
+# Builds the Barnabas Publishing fork from this source instead of pulling the stock Postiz image.
+# Use together with the main file:
+#   docker compose -f docker-compose.yaml -f docker-compose.barnabas.yaml up -d --build
+services:
+  postiz:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+    image: barnabas-publishing:local
