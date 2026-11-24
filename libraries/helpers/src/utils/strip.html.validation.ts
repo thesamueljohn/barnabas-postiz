@@ -137,13 +137,23 @@ export const stripHtmlValidation = (
   replaceBold = false,
   none = false,
   plain = false,
-  convertMentionFunction?: (idOrHandle: string, name: string) => string
+  convertMentionFunction?: (idOrHandle: string, name: string) => string,
+  inlineImages = false
 ): string => {
   if (plain) {
     return val;
   }
 
-  const value = serialize(parseFragment(val));
+  const serialized = serialize(parseFragment(val));
+  // list items are flattened to one line below, so a break inside one is a space
+  const value =
+    type === 'html'
+      ? serialized
+      : serialized
+          .replace(/<li[^>]*>[\s\S]*?<\/li>/gi, (match) =>
+            match.replace(/<br[^>]*>/gi, ' ')
+          )
+          .replace(/<br[^>]*>/gi, '\n');
 
   if (type === 'none') {
     return striptags(value)
@@ -156,7 +166,12 @@ export const stripHtmlValidation = (
   }
 
   if (type === 'html') {
-    return striptags(convertMention(value, convertMentionFunction), [
+    return striptags(
+      convertMention(
+        inlineImages ? convertImages(value) : value,
+        convertMentionFunction
+      ),
+      [
       'ul',
       'li',
       'h1',
@@ -166,7 +181,10 @@ export const stripHtmlValidation = (
       'strong',
       'u',
       'a',
-    ])
+      'br',
+      ...(inlineImages ? ['img'] : []),
+      ]
+    )
       .replace(/&gt;/gi, '>')
       .replace(/&lt;/gi, '<')
       .replace(/&amp;/gi, '&')
@@ -179,17 +197,17 @@ export const stripHtmlValidation = (
     return striptags(
       convertMention(
         value
-          .replace(/<h1>([.\s\S]*?)<\/h1>/g, (match, p1) => {
+          .replace(/<h1[^>]*>([.\s\S]*?)<\/h1>/g, (match, p1) => {
             return `<h1># ${p1}</h1>\n`;
           })
           .replace(/&amp;/gi, '&')
           .replace(/&nbsp;/gi, ' ')
           .replace(/&quot;/gi, '"')
           .replace(/&#39;/gi, "'")
-          .replace(/<h2>([.\s\S]*?)<\/h2>/g, (match, p1) => {
+          .replace(/<h2[^>]*>([.\s\S]*?)<\/h2>/g, (match, p1) => {
             return `<h2>## ${p1}</h2>\n`;
           })
-          .replace(/<h3>([.\s\S]*?)<\/h3>/g, (match, p1) => {
+          .replace(/<h3[^>]*>([.\s\S]*?)<\/h3>/g, (match, p1) => {
             return `<h3>### ${p1}</h3>\n`;
           })
           .replace(/<u>([.\s\S]*?)<\/u>/g, (match, p1) => {
@@ -201,7 +219,7 @@ export const stripHtmlValidation = (
           .replace(/<li.*?>([.\s\S]*?)<\/li.*?>/gm, (match, p1) => {
             return `<li>- ${p1.replace(/\n/gm, '')}</li>`;
           })
-          .replace(/<p>([.\s\S]*?)<\/p>/g, (match, p1) => {
+          .replace(/<p[^>]*>([.\s\S]*?)<\/p>/g, (match, p1) => {
             return `<p>${p1}</p>\n`;
           })
           .replace(
@@ -217,7 +235,7 @@ export const stripHtmlValidation = (
       .replace(/&lt;/gi, '<');
   }
 
-  if (value.indexOf('<p>') === -1 && !none) {
+  if (!/<p[\s>]/i.test(value) && !none) {
     return value;
   }
 
@@ -268,6 +286,22 @@ export const stripHtmlValidation = (
     .replace(/&lt;/gi, '<');
 };
 
+// keeps only an http(s) src and the alt of a picture, a value holding a quote
+// is dropped since &quot; is decoded afterwards and would close the attribute
+export const convertImages = (value: string) => {
+  return value.replace(/<img\b[^>]*>/gi, (match) => {
+    const src = /\ssrc="(https?:\/\/[^"]*)"/i.exec(match)?.[1];
+    const alt = /\salt="([^"]*)"/i.exec(match)?.[1];
+    if (!src || src.includes('&quot;')) {
+      return '';
+    }
+
+    return `<img src="${src}"${
+      alt && !alt.includes('&quot;') ? ` alt="${alt}"` : ''
+    }>`;
+  });
+};
+
 export const convertMention = (
   value: string,
   process?: (idOrHandle: string, name: string) => string
@@ -286,7 +320,7 @@ export const convertMention = (
 
 export const convertToAscii = (value: string): string => {
   return value
-    .replace(/<strong>(.+?)<\/strong>/gi, (match, p1) => {
+    .replace(/<strong>([\s\S]+?)<\/strong>/gi, (match, p1) => {
       const replacer = p1.split('').map((char: string) => {
         // @ts-ignore
         return bold?.[char] || char;
@@ -294,7 +328,7 @@ export const convertToAscii = (value: string): string => {
 
       return match.replace(p1, replacer.join(''));
     })
-    .replace(/<u>(.+?)<\/u>/gi, (match, p1) => {
+    .replace(/<u>([\s\S]+?)<\/u>/gi, (match, p1) => {
       const replacer = p1.split('').map((char: string) => {
         // @ts-ignore
         return underlineMap?.[char] || char;

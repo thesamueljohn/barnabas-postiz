@@ -1,3 +1,4 @@
+import dayjs from 'dayjs';
 import {
   Body,
   Controller,
@@ -20,8 +21,13 @@ import { ApiTags } from '@nestjs/swagger';
 import { GetUserFromRequest } from '@gitroom/nestjs-libraries/user/user.from.request';
 import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/posts.service';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
+import { IntegrationNameDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.name.dto';
+import { CustomerNameDto } from '@gitroom/nestjs-libraries/dtos/integrations/customer.name.dto';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
-import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  Disconnect,
+  RefreshToken,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 
 import { timer } from '@gitroom/helpers/utils/timer';
 import { TelegramProvider } from '@gitroom/nestjs-libraries/integrations/social/telegram.provider';
@@ -63,6 +69,15 @@ export class IntegrationsController {
     return this._integrationService.customers(org.id);
   }
 
+  @Put('/customers/:id')
+  async updateCustomerName(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: CustomerNameDto
+  ) {
+    return this._integrationService.updateCustomerName(org.id, id, body.name);
+  }
+
   @Put('/:id/group')
   async updateIntegrationGroup(
     @GetOrgFromRequest() org: Organization,
@@ -85,6 +100,15 @@ export class IntegrationsController {
     return this._integrationService.updateOnCustomerName(org.id, id, body.name);
   }
 
+  @Put('/:id/custom-name')
+  async updateCustomName(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Body() body: IntegrationNameDto
+  ) {
+    return this._integrationService.updateCustomName(org.id, id, body.name);
+  }
+
   @Get('/list')
   async getIntegrationList(@GetOrgFromRequest() org: Organization) {
     return {
@@ -96,7 +120,8 @@ export class IntegrationsController {
             p.providerIdentifier
           );
           return {
-            name: p.name,
+            name: p.customName || p.name,
+            originalName: p.name,
             id: p.id,
             internalId: p.internalId,
             disabled: p.disabled,
@@ -104,9 +129,13 @@ export class IntegrationsController {
             stripLinks: !!findIntegration?.stripLinks?.(),
             picture: p.picture || '/no-picture.jpg',
             identifier: p.providerIdentifier,
-            inBetweenSteps: p.inBetweenSteps,
+            inBetweenSteps: this._integrationService.needsPageSelection(
+              p,
+              findIntegration
+            ),
             refreshNeeded: p.refreshNeeded,
             isCustomFields: !!findIntegration.customFields,
+            isChromeExtension: !!findIntegration.isChromeExtension,
             ...(findIntegration.customFields
               ? { customFields: await findIntegration.customFields() }
               : {}),
@@ -208,8 +237,16 @@ export class IntegrationsController {
       throw new Error('Integration not allowed');
     }
 
-    const integrationProvider =
-      this._integrationManager.getSocialIntegration(integration);
+    // A provider migrated via MIGRATE_PROVIDERS reconnects through its target
+    // provider's OAuth: the callback lands on the target and the channel is
+    // migrated in place (see migrateIntegration).
+    const migrateTo = refresh
+      ? this._integrationManager.getMigrationTarget(integration)
+      : undefined;
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      migrateTo || integration
+    );
 
     if (integrationProvider.externalUrl && !externalUrl) {
       throw new Error('Missing external url');
@@ -277,7 +314,9 @@ export class IntegrationsController {
 
     let newList: any[] | { none: true } = [];
     try {
-      newList = (await this.functionIntegration(org, body)) || [];
+      newList =
+        (await this.functionIntegration(org, { ...body, name: 'mention' })) ||
+        [];
     } catch (err) {
       console.log(err);
     }
@@ -338,8 +377,37 @@ export class IntegrationsController {
       throw new Error('Invalid provider');
     }
 
-    // @ts-ignore
-    if (integrationProvider[body.name]) {
+    // Only for a channel that still has to select its page: other channels
+    // post fine past the stored expiration, a failed refresh would flag them.
+    if (
+      this._integrationService.needsPageSelection(
+        getIntegration,
+        integrationProvider
+      ) &&
+      dayjs(getIntegration.tokenExpiration).isBefore(dayjs())
+    ) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+
+      if (!data) {
+        return false;
+      }
+
+      getIntegration.token = data.accessToken;
+      getIntegration.refreshToken = data.refreshToken;
+
+      if (integrationProvider.refreshWait) {
+        await timer(10000);
+      }
+    }
+
+    if (
+      this._integrationManager.isDashboardCallable(
+        integrationProvider,
+        body.name
+      )
+    ) {
       try {
         // @ts-ignore
         const load = await integrationProvider[body.name](
@@ -351,6 +419,16 @@ export class IntegrationsController {
 
         return load;
       } catch (err) {
+        // The platform will keep rejecting this channel until the user
+        // re-connects it: mark it as needing a refresh instead of retrying.
+        if (err instanceof Disconnect) {
+          await this._integrationService.disconnectChannel(
+            org.id,
+            getIntegration
+          );
+          return false;
+        }
+
         if (err instanceof RefreshToken) {
           const data = await this._refreshIntegrationService.refresh(
             getIntegration

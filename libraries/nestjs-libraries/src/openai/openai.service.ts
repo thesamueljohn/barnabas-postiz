@@ -16,8 +16,65 @@ const VoicePrompt = z.object({
   voice: z.string(),
 });
 
+const ClipsPrompt = z.object({
+  clips: z.array(
+    z.object({
+      from: z.number().describe('Number of the first line of the clip'),
+      to: z.number().describe('Number of the last line of the clip'),
+      title: z.string().describe('Short title of the clip'),
+      content: z
+        .string()
+        .describe('Social media post to publish the clip with, no hashtags'),
+    })
+  ),
+});
+
 @Injectable()
 export class OpenaiService {
+  // The model answers with line numbers and not times, so a clip can only
+  // start and end where the transcript really has a boundary
+  async pickClips(
+    title: string,
+    language: string,
+    segments: { start: number; end: number; text: string }[],
+    maxClips: number
+  ) {
+    const { clips } = (
+      await openai.chat.completions.parse(
+        {
+          model: 'gpt-6.2-sol',
+          messages: [
+            {
+              role: 'system',
+              content: `You are an assistant that takes the transcript of a video and picks the parts that will work best as short vertical clips for social media.
+Every line of the transcript is "number [start seconds - end seconds] text".
+Pick up to ${maxClips} clips, best first. A clip is a range of consecutive lines that starts with a hook, makes one complete point and is understandable without the rest of the video.
+The length of a clip is the end of its last line minus the start of its first line: it must be between 20 and 90 seconds, never longer, so check the numbers before answering.
+Clips must not overlap. Write the title and the post in this language, whatever the language of these instructions: ${language}.`,
+            },
+            {
+              role: 'user',
+              content: `title: ${title}\n\n${segments
+                .map(
+                  (p, index) =>
+                    `${index} [${p.start.toFixed(1)} - ${p.end.toFixed(1)}] ${
+                      p.text
+                    }`
+                )
+                .join('\n')}`,
+            },
+          ],
+          response_format: zodResponseFormat(ClipsPrompt, 'clipsPrompt'),
+        },
+        // shorter than the activity: an attempt that was given up on must not
+        // still be running, and storing clips, when its retry gets there
+        { timeout: 8 * 60 * 1000, maxRetries: 0 }
+      )
+    ).choices[0].message.parsed || { clips: [] };
+
+    return clips;
+  }
+
   async generateImage(prompt: string, isVertical = false) {
     // gpt-image models always return base64 (b64_json) and do not accept the
     // `response_format` parameter, unlike the deprecated dall-e-3.
@@ -29,6 +86,10 @@ export class OpenaiService {
       })
     ).data[0];
 
+    if (!generate?.b64_json) {
+      throw new Error('Image generation returned no image data');
+    }
+
     return generate.b64_json;
   }
 
@@ -36,7 +97,7 @@ export class OpenaiService {
     return (
       (
         await openai.chat.completions.parse({
-          model: 'gpt-4.1',
+          model: 'gpt-6.2-sol',
           messages: [
             {
               role: 'system',
@@ -57,7 +118,7 @@ export class OpenaiService {
     return (
       (
         await openai.chat.completions.parse({
-          model: 'gpt-4.1',
+          model: 'gpt-6.2-sol',
           messages: [
             {
               role: 'system',
@@ -75,41 +136,32 @@ export class OpenaiService {
   }
 
   async generatePosts(content: string) {
+    // gpt-6 models do not accept the `n` parameter, so each of the 5
+    // variations of a prompt is its own request
     const posts = (
-      await Promise.all([
-        openai.chat.completions.create({
-          messages: [
-            {
-              role: 'assistant',
-              content:
-                'Generate a Twitter post from the content without emojis in the following JSON format: { "post": string } put it in an array with one element',
-            },
-            {
-              role: 'user',
-              content: content!,
-            },
-          ],
-          n: 5,
-          temperature: 1,
-          model: 'gpt-4.1',
-        }),
-        openai.chat.completions.create({
-          messages: [
-            {
-              role: 'assistant',
-              content:
-                'Generate a thread for social media in the following JSON format: Array<{ "post": string }> without emojis',
-            },
-            {
-              role: 'user',
-              content: content!,
-            },
-          ],
-          n: 5,
-          temperature: 1,
-          model: 'gpt-4.1',
-        }),
-      ])
+      await Promise.all(
+        [
+          'Generate a Twitter post from the content without emojis in the following JSON format: { "post": string } put it in an array with one element',
+          'Generate a thread for social media in the following JSON format: Array<{ "post": string }> without emojis',
+        ].flatMap((prompt) =>
+          [...new Array(5)].map(() =>
+            openai.chat.completions.create({
+              messages: [
+                {
+                  role: 'assistant',
+                  content: prompt,
+                },
+                {
+                  role: 'user',
+                  content: content!,
+                },
+              ],
+              temperature: 1,
+              model: 'gpt-6.2-sol',
+            })
+          )
+        )
+      )
     ).flatMap((p) => p.choices);
 
     return shuffle(
@@ -145,7 +197,7 @@ export class OpenaiService {
           content,
         },
       ],
-      model: 'gpt-4.1',
+      model: 'gpt-6.2-sol',
     });
 
     const { content: articleContent } = websiteContent.choices[0].message;
@@ -165,7 +217,10 @@ export class OpenaiService {
     const posts =
       (
         await openai.chat.completions.parse({
-          model: 'gpt-4.1',
+          model: 'gpt-6.2-sol',
+          // at the default effort the model spends around 40 seconds checking
+          // the lengths, low keeps them right in about a third of the time
+          reasoning_effort: 'low',
           messages: [
             {
               role: 'system',
@@ -198,7 +253,8 @@ export class OpenaiService {
               return (
                 (
                   await openai.chat.completions.parse({
-                    model: 'gpt-4.1',
+                    model: 'gpt-6.2-sol',
+                    reasoning_effort: 'low',
                     messages: [
                       {
                         role: 'system',
@@ -234,7 +290,7 @@ export class OpenaiService {
         const parse =
           (
             await openai.chat.completions.parse({
-              model: 'gpt-4.1',
+              model: 'gpt-6.2-sol',
               messages: [
                 {
                   role: 'system',

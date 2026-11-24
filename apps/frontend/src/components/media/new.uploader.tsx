@@ -3,7 +3,10 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import Uppy, { BasePlugin, UploadResult, UppyFile } from '@uppy/core';
 // @ts-ignore
 import { useFetch } from '@gitroom/helpers/utils/custom.fetch';
-import { getUppyUploadPlugin } from '@gitroom/react/helpers/uppy.upload';
+import {
+  getUppyUploadPlugin,
+  WaitForMediaProcessing,
+} from '@gitroom/react/helpers/uppy.upload';
 import { Dashboard, FileInput, ProgressBar } from '@uppy/react';
 
 // Uppy styles
@@ -12,7 +15,6 @@ import Compressor from '@uppy/compressor';
 import { useT } from '@gitroom/react/translation/get.transation.service.client';
 import { useToaster } from '@gitroom/react/toaster/toaster';
 import { useLaunchStore } from '@gitroom/frontend/components/new-launch/store';
-import { uniqBy } from 'lodash';
 
 export class CompressionWrapper<M = any, B = any> extends Compressor<any, any> {
   override async prepareUpload(fileIDs: string[]) {
@@ -44,8 +46,13 @@ export function useUppyUploader(props: {
 }) {
   const setLocked = useLaunchStore((state) => state.setLocked);
   const toast = useToaster();
-  const { storageProvider, backendUrl, disableImageCompression, transloadit } =
-    useVariables();
+  const t = useT();
+  const {
+    storageProvider,
+    backendUrl,
+    disableImageCompression,
+    mediaProcessing,
+  } = useVariables();
   const { onUploadSuccess, allowedFileTypes } = props;
   const fetch = useFetch();
   return useMemo(() => {
@@ -84,8 +91,9 @@ export function useUppyUploader(props: {
           if (type === 'video/*') {
             return ['video/mp4', 'video/mpeg', 'video/quicktime'];
           }
-          if (type === 'video/mp4' && transloadit && transloadit.length > 0) {
-            return ['video/mp4', 'video/mpeg', 'video/quicktime'];
+          // the normalizer turns QuickTime into mp4, nothing else is accepted by the bucket
+          if (type === 'video/mp4' && mediaProcessing) {
+            return ['video/mp4', 'video/quicktime'];
           }
           return [type];
         });
@@ -168,14 +176,26 @@ export function useUppyUploader(props: {
     });
 
     const { plugin, options } = getUppyUploadPlugin(
-      transloadit.length > 0 ? 'transloadit' : storageProvider,
+      storageProvider,
       fetch,
-      backendUrl,
-      transloadit
+      backendUrl
     );
 
     uppy2.use(plugin, options);
-    if (!disableImageCompression) {
+    // installed whenever the record can come back "processing", so the backend
+    // decides; it passes files through untouched when the row is already ready
+    if (storageProvider === 'cloudflare') {
+      uppy2.use(WaitForMediaProcessing, {
+        fetch,
+        processingMessage: t('processing', 'Processing...'),
+        fallbackMessage: t(
+          'could_not_optimize_file',
+          'Could not optimize the file, the original will be used'
+        ),
+      });
+    }
+    // the normalizer resizes on the server, shrinking first would only make it upscale a blurry copy
+    if (!disableImageCompression && !mediaProcessing) {
       uppy2.use(CompressionWrapper, {
         convertTypes: ['image/jpeg', 'image/png', 'image/webp'],
         maxWidth: 1000,
@@ -193,7 +213,11 @@ export function useUppyUploader(props: {
       });
     });
     uppy2.on('error', (result) => {
-      uppy2.clear();
+      // a single file failing leaves the batch running, 'complete' reports it with the rest
+      if (Object.keys(uppy2.getState().currentUploads).length) {
+        return;
+      }
+      uppy2.cancelAll();
       setLocked(false);
       props.onEnd();
       fileOrderIndex = 0;
@@ -203,8 +227,18 @@ export function useUppyUploader(props: {
     });
     uppy2.on('complete', async (result) => {
       console.log(result);
-      for (const file of [...result.successful]) {
+      for (const file of [...result.successful, ...(result.failed || [])]) {
         uppy2.removeFile(file.id);
+      }
+
+      if (result.failed?.length) {
+        toast.show(
+          t(
+            'some_files_failed_to_upload',
+            'Some files failed to upload, please try again'
+          ),
+          'warning'
+        );
       }
 
       props.onEnd();
@@ -222,57 +256,19 @@ export function useUppyUploader(props: {
         return;
       }
 
-      if (transloadit.length > 0) {
-        // @ts-ignore
-        const allRes = result.transloadit[0].results;
-        const toSave = uniqBy<{ name: string; originalName: string; order: number }>(
-          // @ts-ignore
-          Object.values(allRes).flatMap((p: any[]) => {
-            return p.flatMap((item) => ({
-              name: item.url.split('/').pop(),
-              originalName: item.name || '',
-              order: +item.user_meta.addedOrder,
-            }));
-          }),
-          (item) => item.name
-        );
-
-        const loadAllMedia = (
-          await Promise.all(
-            toSave.map(async ({ name, originalName, order }) => ({
-              file: await (
-                await fetch('/media/save-media', {
-                  method: 'POST',
-                  body: JSON.stringify({
-                    name,
-                    originalName,
-                  }),
-                })
-              ).json(),
-              order,
-            }))
-          )
-        )
-          .sort((a, b) => {
-            return a.order - b.order;
-          })
-          .map((p) => p.file);
-
-        setLocked(false);
-        fileOrderIndex = 0;
-        onUploadSuccess(loadAllMedia);
-        return;
-      }
-
       setLocked(false);
       fileOrderIndex = 0;
       onUploadSuccess(sortedSuccessful.map((p) => p.response.body.saved));
     });
     uppy2.on('upload-success', (file, response) => {
+      const current = uppy2.getState().files[file.id];
+      if (!current) {
+        return;
+      }
       // @ts-ignore
       uppy2.setFileState(file.id, {
         // @ts-ignore
-        progress: uppy2.getState().files[file.id].progress,
+        progress: current.progress,
         // @ts-ignore
         uploadURL: response.body.Location,
         response: response,

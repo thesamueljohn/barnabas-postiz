@@ -16,7 +16,10 @@ import { NotificationService } from '@gitroom/nestjs-libraries/database/prisma/n
 import dayjs from 'dayjs';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
-import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  NotEnoughScopes,
+  RefreshToken,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { IntegrationTimeDto } from '@gitroom/nestjs-libraries/dtos/integrations/integration.time.dto';
 import { UploadFactory } from '@gitroom/nestjs-libraries/upload/upload.factory';
 import { PlugDto } from '@gitroom/nestjs-libraries/dtos/plugs/plug.dto';
@@ -25,6 +28,12 @@ import utc from 'dayjs/plugin/utc';
 import { AutopostRepository } from '@gitroom/nestjs-libraries/database/prisma/autopost/autopost.repository';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { TemporalService } from 'nestjs-temporal-core';
+import { randomBytes } from 'crypto';
+import { ApplicationFailure } from '@temporalio/common';
+import {
+  EncryptionService,
+  integrationEncryptedFields,
+} from '@gitroom/nestjs-libraries/services/encryption.service';
 
 dayjs.extend(utc);
 
@@ -38,7 +47,8 @@ export class IntegrationService {
     private _notificationService: NotificationService,
     @Inject(forwardRef(() => RefreshIntegrationService))
     private _refreshIntegrationService: RefreshIntegrationService,
-    private _temporalService: TemporalService
+    private _temporalService: TemporalService,
+    private _encryptionService: EncryptionService
   ) {}
 
   async changeActiveCron(orgId: string) {
@@ -108,7 +118,9 @@ export class IntegrationService {
     isBetweenSteps = false,
     refresh?: string,
     timezone?: number,
-    customInstanceDetails?: string
+    customInstanceDetails?: string,
+    rootInternalId?: string,
+    expectedRootInternalId?: string | null
   ) {
     const uploadedPicture = picture
       ? picture?.indexOf('imagedelivery.net') > -1
@@ -135,7 +147,9 @@ export class IntegrationService {
       isBetweenSteps,
       refresh,
       timezone,
-      customInstanceDetails
+      customInstanceDetails,
+      rootInternalId,
+      expectedRootInternalId
     );
   }
 
@@ -151,6 +165,29 @@ export class IntegrationService {
     return this._integrationRepository.getIntegrationsList(org);
   }
 
+  getChannelHealth(org: string, includeDeleted = false) {
+    return this._integrationRepository.getChannelHealth(org, includeDeleted);
+  }
+
+  // Only for providers that cannot post without a selected page: the channel
+  // is still in between steps, or its internalId still equals the account id
+  // because a token refresh flipped inBetweenSteps off
+  needsPageSelection(
+    integration: Pick<
+      Integration,
+      'inBetweenSteps' | 'internalId' | 'rootInternalId'
+    >,
+    provider: SocialProvider
+  ) {
+    return (
+      !!provider?.pageRequiredToPost &&
+      (integration.inBetweenSteps ||
+        (!!integration.rootInternalId &&
+          integration.internalId === integration.rootInternalId &&
+          !provider.isPageId?.(integration.internalId)))
+    );
+  }
+
   getIntegrationForOrder(id: string, order: string, user: string, org: string) {
     return this._integrationRepository.getIntegrationForOrder(
       id,
@@ -160,12 +197,23 @@ export class IntegrationService {
     );
   }
 
+  updateCustomName(org: string, id: string, name: string) {
+    return this._integrationRepository.updateCustomName(org, id, name);
+  }
+
   updateNameAndUrl(id: string, name: string, url: string) {
     return this._integrationRepository.updateNameAndUrl(id, name, url);
   }
 
   getIntegrationById(org: string, id: string) {
     return this._integrationRepository.getIntegrationById(org, id);
+  }
+
+  getIntegrationByInternalId(org: string, internalId: string) {
+    return this._integrationRepository.getIntegrationByInternalId(
+      org,
+      internalId
+    );
   }
 
   async refreshToken(provider: SocialProvider, refresh: string) {
@@ -183,9 +231,116 @@ export class IntegrationService {
     }
   }
 
-  async disconnectChannel(orgId: string, integration: Integration) {
+  async disconnectChannel(orgId: string, integration: Integration, err = '') {
     await this._integrationRepository.disconnectChannel(orgId, integration.id);
-    await this.informAboutRefreshError(orgId, integration);
+    await this.informAboutRefreshError(orgId, integration, err);
+  }
+
+  // A reconnect that came back from a different provider (MIGRATE_PROVIDERS):
+  // match the disconnected channel by profile and move it to the new provider
+  // in place, so scheduled posts, settings and customers survive. Throws the
+  // same error as a mismatched reconnect when the migration is not configured
+  // or the user connected a different account.
+  async migrateIntegration(
+    org: string,
+    oldInternalId: string,
+    newProvider: string,
+    auth: { id: string; username: string }
+  ) {
+    const existing = await this._integrationRepository.getIntegrationByInternalId(
+      org,
+      oldInternalId
+    );
+
+    if (
+      !existing ||
+      this._integrationManager.getMigrationTarget(
+        existing.providerIdentifier
+      ) !== newProvider
+    ) {
+      throw new NotEnoughScopes(
+        'Please refresh the channel that needs to be refreshed'
+      );
+    }
+
+    const oldProvider = this._integrationManager.getSocialIntegration(
+      existing.providerIdentifier
+    );
+
+    if (!oldProvider.migrationMatch(auth, existing)) {
+      throw new NotEnoughScopes(
+        `Please connect the same account (@${existing.profile}) that needs to be refreshed`
+      );
+    }
+
+    if (
+      await this._integrationRepository.getIntegrationByInternalId(org, auth.id)
+    ) {
+      throw new NotEnoughScopes(
+        'This account is already connected as another channel, please delete one of them first'
+      );
+    }
+
+    return this._integrationRepository.migrateIntegration(
+      org,
+      existing.id,
+      auth.id,
+      newProvider,
+      existing.rootInternalId === existing.internalId
+        ? auth.id
+        : existing.rootInternalId
+    );
+  }
+
+  // A fresh connect of a migration target (MIGRATE_PROVIDERS) for an account
+  // the org already has on the source provider: adopt that channel instead of
+  // creating a confusing duplicate - the channel is migrated in place exactly
+  // like a reconnect, and the follow-up upsert stores the fresh tokens. A no-op
+  // when nothing matches, so a genuinely new account still creates a channel.
+  async migrateIntegrationOnConnect(
+    org: string,
+    newProvider: string,
+    auth: { id: string; username: string }
+  ) {
+    const sources = this._integrationManager.getMigrationSources(newProvider);
+    if (
+      !sources.length ||
+      this._integrationManager.getSocialIntegration(newProvider).isBetweenSteps
+    ) {
+      return;
+    }
+
+    // the account already exists on the new provider: the normal upsert
+    // updates it, nothing to adopt
+    if (
+      await this._integrationRepository.getIntegrationByInternalId(org, auth.id)
+    ) {
+      return;
+    }
+
+    const existing = (
+      await this._integrationRepository.getIntegrationsList(org)
+    ).find(
+      (p) =>
+        sources.includes(p.providerIdentifier) &&
+        this._integrationManager
+          .getSocialIntegration(p.providerIdentifier)
+          .migrationMatch(auth, p)
+    );
+
+    if (!existing) {
+      return;
+    }
+
+    return this._integrationRepository.migrateIntegration(
+      org,
+      existing.id,
+      auth.id,
+      newProvider,
+      existing.rootInternalId === existing.internalId
+        ? auth.id
+        : existing.rootInternalId
+    );
   }
 
   async informAboutRefreshError(
@@ -195,7 +350,7 @@ export class IntegrationService {
   ) {
     await this._notificationService.inAppNotification(
       orgId,
-      `Could not refresh your ${integration.providerIdentifier} channel ${err}`,
+      `Could not refresh your ${integration.providerIdentifier} channel`,
       `Could not refresh your ${integration.providerIdentifier} channel ${err}. Please go back to the system and connect it again ${process.env.FRONTEND_URL}/launches`,
       true,
       false,
@@ -221,22 +376,27 @@ export class IntegrationService {
       const data = await this.refreshToken(provider, integration.refreshToken!);
 
       if (!data) {
-        await this.informAboutRefreshError(
-          integration.organizationId,
-          integration
-        );
-        await this._integrationRepository.refreshNeeded(
+        const flagged = await this._integrationRepository.refreshNeeded(
           integration.organizationId,
           integration.id
         );
-        return;
+        if (flagged) {
+          await this.informAboutRefreshError(
+            integration.organizationId,
+            integration
+          );
+        }
+        continue;
       }
 
       const { refreshToken, accessToken, expiresIn } = data;
 
       await this.createOrUpdateIntegration(
         undefined,
-        !!provider.oneTimeToken,
+        // a root that is a page id (older channels) names no login: other
+        // organizations' channels of that page can belong to other logins
+        !!provider.oneTimeToken &&
+          !provider.isPageId?.(integration.rootInternalId || ''),
         integration.organizationId,
         integration.name,
         undefined,
@@ -245,7 +405,15 @@ export class IntegrationService {
         integration.providerIdentifier,
         accessToken,
         refreshToken,
-        expiresIn
+        expiresIn,
+        undefined,
+        false,
+        undefined,
+        undefined,
+        undefined,
+        undefined,
+        // stored only if no reconnect moved the channel meanwhile
+        integration.rootInternalId
       );
     }
   }
@@ -280,6 +448,10 @@ export class IntegrationService {
     return this._integrationRepository.disableIntegrations(org, totalChannels);
   }
 
+  async enableAllIntegrations(org: string) {
+    return this._integrationRepository.enableAllIntegrations(org);
+  }
+
   async checkForDeletedOnceAndUpdate(org: string, page: string) {
     return this._integrationRepository.checkForDeletedOnceAndUpdate(org, page);
   }
@@ -292,13 +464,16 @@ export class IntegrationService {
     if (!getIntegration) {
       throw new HttpException('Integration not found', HttpStatus.NOT_FOUND);
     }
-    if (!getIntegration.inBetweenSteps) {
-      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
-    }
-
     const provider = this._integrationManager.getSocialIntegration(
       getIntegration.providerIdentifier
     );
+
+    if (
+      !getIntegration.inBetweenSteps &&
+      !this.needsPageSelection(getIntegration, provider)
+    ) {
+      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
+    }
 
     if (!provider.fetchPageInformation) {
       throw new HttpException(
@@ -316,17 +491,151 @@ export class IntegrationService {
       org,
       String(getIntegrationInformation.id)
     );
-    await this._integrationRepository.updateIntegration(id, {
-      picture: getIntegrationInformation.picture,
-      internalId: String(getIntegrationInformation.id),
-      organizationId: org,
-      name: getIntegrationInformation.name,
-      inBetweenSteps: false,
-      token: getIntegrationInformation.access_token,
-      profile: getIntegrationInformation.username,
-    });
+    const saved = await this._integrationRepository.updateIntegration(
+      id,
+      {
+        picture: getIntegrationInformation.picture,
+        internalId: String(getIntegrationInformation.id),
+        organizationId: org,
+        name: getIntegrationInformation.name,
+        inBetweenSteps: false,
+        token: getIntegrationInformation.access_token,
+        profile: getIntegrationInformation.username,
+      },
+      getIntegration
+    );
+
+    if (!saved) {
+      throw new HttpException('Invalid request', HttpStatus.BAD_REQUEST);
+    }
 
     return { success: true };
+  }
+
+  // Connect links (public API): the link opens a Postiz page that explains what
+  // connecting the channel means, and only from there the person is sent to
+  // the platform. Like the invite links of the dashboard, only providers that
+  // connect with a plain redirect can be linked.
+  async createConnectLink(
+    org: string,
+    integration: string,
+    redirectUrl?: string
+  ) {
+    if (
+      !this._integrationManager
+        .getAllowedSocialsIntegrations()
+        .includes(integration) ||
+      this._integrationManager.isHiddenProvider(integration)
+    ) {
+      throw new HttpException('Integration not allowed', HttpStatus.BAD_REQUEST);
+    }
+
+    if (
+      !this._integrationManager
+        .getLinkableSocialsIntegrations()
+        .includes(integration)
+    ) {
+      throw new HttpException(
+        'This integration cannot be connected with a link',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+
+    const token = randomBytes(32).toString('hex');
+    await ioRedis.set(
+      `connectLink:${token}`,
+      JSON.stringify({
+        org,
+        integration,
+        redirectUrl,
+        redirectTo: redirectUrl
+          ? this.connectLinkRedirectHost(redirectUrl)
+          : undefined,
+      }),
+      'EX',
+      3600
+    );
+
+    return { url: `${process.env.FRONTEND_URL}/integrations/connect/${token}` };
+  }
+
+  // The browser is sent to this URL with the result added to its query string,
+  // and the page shows its host: it has to be http(s), parse the way a browser
+  // reads it and carry no fragment
+  private connectLinkRedirectHost(redirectUrl: string) {
+    try {
+      const { protocol, host } = new URL(redirectUrl);
+      if (
+        ['http:', 'https:'].includes(protocol) &&
+        !redirectUrl.includes('#')
+      ) {
+        return host;
+      }
+    } catch (err) {}
+
+    throw new HttpException(
+      'The redirect URL must be an http(s) URL without a fragment',
+      HttpStatus.BAD_REQUEST
+    );
+  }
+
+  private async loadConnectLink(token: string) {
+    const link = JSON.parse(
+      (await ioRedis.get(`connectLink:${token}`)) || 'null'
+    ) as {
+      org: string;
+      integration: string;
+      redirectUrl?: string;
+      redirectTo?: string;
+    } | null;
+    if (!link) {
+      throw new HttpException(
+        'This connection link expired, please ask for a new one',
+        HttpStatus.NOT_FOUND
+      );
+    }
+    return link;
+  }
+
+  // The organization the channel is added to, the controller checks its plan
+  async getConnectLinkOrganization(token: string) {
+    return (await this.loadConnectLink(token)).org;
+  }
+
+  // What the page shows: the platform, and where the person ends up afterwards
+  async getConnectLink(token: string) {
+    const { integration, redirectTo } = await this.loadConnectLink(token);
+    const provider = this._integrationManager.getSocialIntegration(integration);
+    return {
+      identifier: provider.identifier,
+      name: provider.name,
+      ...(redirectTo ? { redirectTo } : {}),
+    };
+  }
+
+  // The person agreed: from here it is the same flow as connecting from the
+  // dashboard, the platform sends them back to /integrations/social/:provider.
+  // The link stays valid until it expires, so they can come back and try again
+  async startConnectLink(token: string) {
+    const { org, integration, redirectUrl } = await this.loadConnectLink(token);
+    const provider = this._integrationManager.getSocialIntegration(integration);
+
+    try {
+      const { codeVerifier, state, url } = await provider.generateAuthUrl();
+
+      await ioRedis.set(`organization:${state}`, org, 'EX', 3600);
+      await ioRedis.set(`login:${state}`, codeVerifier, 'EX', 3600);
+      if (redirectUrl) {
+        await ioRedis.set(`redirect:${state}`, redirectUrl, 'EX', 3600);
+      }
+
+      return { url };
+    } catch (err) {
+      throw new HttpException(
+        'Failed to generate auth URL',
+        HttpStatus.INTERNAL_SERVER_ERROR
+      );
+    }
   }
 
   async checkAnalytics(
@@ -335,6 +644,8 @@ export class IntegrationService {
     date: string,
     forceRefresh = false
   ): Promise<AnalyticsData[]> {
+    // Days to load, missing or invalid on some public API calls (same default as the app)
+    const days = Number(date) > 0 ? Number(date) : 7;
     const getIntegration = await this.getIntegrationById(org.id, integration);
 
     if (!getIntegration) {
@@ -349,8 +660,14 @@ export class IntegrationService {
       getIntegration.providerIdentifier
     );
 
+    // A deleted channel is neither refreshed nor called
+    if (getIntegration.deletedAt) {
+      return [];
+    }
+
     if (
-      dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) ||
+      (dayjs(getIntegration?.tokenExpiration).isBefore(dayjs()) &&
+        !integrationProvider.noRefreshBeforeCall) ||
       forceRefresh
     ) {
       const data = await this._refreshIntegrationService.refresh(
@@ -375,7 +692,7 @@ export class IntegrationService {
     }
 
     const getIntegrationData = await ioRedis.get(
-      `integration:${org.id}:${integration}:${date}`
+      `integration:${org.id}:${integration}:${days}`
     );
     if (getIntegrationData) {
       return JSON.parse(getIntegrationData);
@@ -386,10 +703,10 @@ export class IntegrationService {
         const loadAnalytics = await integrationProvider.analytics(
           getIntegration.internalId,
           getIntegration.token,
-          +date
+          days
         );
         await ioRedis.set(
-          `integration:${org.id}:${integration}:${date}`,
+          `integration:${org.id}:${integration}:${days}`,
           JSON.stringify(loadAnalytics),
           'EX',
           !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
@@ -409,6 +726,20 @@ export class IntegrationService {
 
   customers(orgId: string) {
     return this._integrationRepository.customers(orgId);
+  }
+
+  async updateCustomerName(orgId: string, id: string, name: string) {
+    const exists = await this._integrationRepository.getCustomerByName(
+      orgId,
+      name
+    );
+    if (exists && exists.id !== id) {
+      throw new HttpException(
+        'A group with this name already exists',
+        HttpStatus.BAD_REQUEST
+      );
+    }
+    return this._integrationRepository.updateCustomerName(orgId, id, name);
   }
 
   getPlugsByIntegrationId(org: string, integrationId: string) {
@@ -548,6 +879,64 @@ export class IntegrationService {
     );
     const loadOnlyIds = exisingData.map((p) => p.value);
     return difference(id, loadOnlyIds);
+  }
+
+  // The tokens of a channel that came from a workflow. A workflow carries the
+  // channel from one activity to the next, so an activity can get its tokens
+  // encrypted (an activity handed them out that way) or plain (the workflow
+  // started before the tokens were encrypted, or the install has no
+  // encryption), and even one of each. Every activity that uses a token of a
+  // channel it got from a workflow goes through here first; a plain token is
+  // used as it is.
+  async decryptTokens<T extends Partial<Integration>>(integration: T) {
+    return integration
+      ? this._encryptionService.decryptFields(
+          integration,
+          integrationEncryptedFields
+        )
+      : integration;
+  }
+
+  // One page of the encryptTokensWorkflow: encrypts the tokens that are still
+  // stored plain. New tokens are already stored encrypted, this is for the
+  // ones that were stored before the encryption.
+  async encryptStoredTokens(afterId?: string) {
+    if (!this._encryptionService.canEncrypt()) {
+      // a configuration that has to change first, no retry will fix it
+      throw ApplicationFailure.nonRetryable(
+        'The encryption is off, set ENCRYPTION_PROVIDER and remove ENCRYPTION_READ_ONLY'
+      );
+    }
+
+    const integrations = await this._integrationRepository.getPlainTokens(
+      afterId
+    );
+
+    // A channel that cannot be encrypted is counted and skipped, it must not
+    // stop all the channels after it
+    let changed = 0;
+    let failed = 0;
+    for (const integration of integrations) {
+      try {
+        if (
+          await this._integrationRepository.encryptStoredTokens(integration)
+        ) {
+          changed++;
+        }
+      } catch (err) {
+        failed++;
+        console.error(
+          `Could not encrypt the stored tokens of integration ${integration.id}:`,
+          (err as Error)?.message
+        );
+      }
+    }
+
+    return {
+      changed,
+      failed,
+      lastId: integrations[integrations.length - 1]?.id,
+    };
   }
 
   async findFreeDateTime(
